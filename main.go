@@ -3,42 +3,80 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"os"
+	"os/signal"
+	"strconv"
 	"sync"
+	"syscall"
 	"time"
 )
 
-const (
-	PR = 5 // número de produtores
-	CN = 1 // número de consumidores
-	N  = 5 // tamanho do buffer
+// Configuração via argumentos de linha de comando
+var (
+	PR        int  // número de produtores
+	CN        int  // número de consumidores
+	N         int  // tamanho do buffer
+	runTime   int  // tempo de execução em segundos
+	debugging bool // modo de depuração
 )
 
 var (
-	buffer     [N]int
+	buffer     []int
 	indexIn    int
 	indexOut   int
 	mutex      sync.Mutex
-	empty      = make(chan struct{}, N) // semáforo de posições livres
-	full       = make(chan struct{}, 0) // semáforo de posições ocupadas
+	empty      chan struct{} // semáforo de posições livres
+	full       chan struct{} // semáforo de posições ocupadas
 	shutdown   = make(chan struct{})    // canal para encerramento
 	wg         sync.WaitGroup
 	operations int // contador de operações para debug
 )
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
+	// Inicialização com valores padrão
+	PR = 5
+	CN = 1
+	N = 5
+	runTime = 30
+	debugging = true
 
-	// Inicializando o buffer
+	// Configuração via argumentos de linha de comando
+	if len(os.Args) > 1 {
+		parseArgs()
+	}
+
+	// Verificação de argumentos válidos
+	if PR <= 0 || CN <= 0 || N <= 0 {
+		fmt.Println("[ERRO] Número de produtores, consumidores e tamanho do buffer devem ser maiores que zero")
+		os.Exit(1)
+	}
+
+	// Inicialização das estruturas
+	rand.Seed(time.Now().UnixNano())
+	buffer = make([]int, N)
+	empty = make(chan struct{}, N)  // semáforo com capacidade N
+	full = make(chan struct{}, N)   // semáforo com capacidade N (corrigido)
+
+	// Inicializando o buffer (todas posições vazias)
 	for i := 0; i < N; i++ {
 		empty <- struct{}{}
 	}
 
 	fmt.Println("[SISTEMA] Buffer inicializado!")
-	fmt.Printf("[SISTEMA] Iniciando com %d produtores e %d consumidor\n", PR, CN)
+	fmt.Printf("[SISTEMA] Iniciando com %d produtores, %d consumidores e buffer de tamanho %d\n", PR, CN, N)
+	fmt.Printf("[SISTEMA] Tempo de execução: %d segundos\n", runTime)
 
 	// Capturar Ctrl+C para encerramento
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	
 	go func() {
-		time.Sleep(30 * time.Second) // Encerra após 30 segundos para teste
+		select {
+		case <-sigChan:
+			fmt.Println("\n[SISTEMA] Sinal de interrupção recebido")
+		case <-time.After(time.Duration(runTime) * time.Second):
+			fmt.Printf("\n[SISTEMA] Tempo de execução (%ds) atingido\n", runTime)
+		}
 		close(shutdown)
 	}()
 
@@ -58,46 +96,88 @@ func main() {
 	fmt.Println("[SISTEMA] Programa encerrado")
 }
 
+// Função para analisar argumentos de linha de comando
+func parseArgs() {
+	// Formato: go run main.go [produtores] [consumidores] [tamanho_buffer] [tempo_execucao] [debug]
+	if len(os.Args) > 1 {
+		if p, err := strconv.Atoi(os.Args[1]); err == nil {
+			PR = p
+		}
+	}
+	if len(os.Args) > 2 {
+		if c, err := strconv.Atoi(os.Args[2]); err == nil {
+			CN = c
+		}
+	}
+	if len(os.Args) > 3 {
+		if n, err := strconv.Atoi(os.Args[3]); err == nil {
+			N = n
+		}
+	}
+	if len(os.Args) > 4 {
+		if t, err := strconv.Atoi(os.Args[4]); err == nil {
+			runTime = t
+		}
+	}
+	if len(os.Args) > 5 {
+		if d, err := strconv.ParseBool(os.Args[5]); err == nil {
+			debugging = d
+		}
+	}
+}
+
+func log(format string, args ...interface{}) {
+	if debugging {
+		fmt.Printf(format, args...)
+	}
+}
+
 func produtor(id int) {
 	defer wg.Done()
+	produzidos := 0
+
 	for {
 		select {
 		case <-shutdown:
-			fmt.Printf("[PRODUTOR %d] Encerrando\n", id)
+			fmt.Printf("[PRODUTOR %d] Encerrando após produzir %d itens\n", id, produzidos)
 			return
 		default:
 			item := rand.Intn(100) + 1 // produz dado (1-100)
-
+			
 			// Log antes da inserção
-			fmt.Printf("[PRODUTOR %d] Quer inserir %d. Posições livres: %d/%d\n",
-				id, item, len(empty), N)
-
-			<-empty // aguarda posição livre
-			mutex.Lock()
-
-			// Debug: estado antes da inserção
-			operations++
-			opID := operations
-			fmt.Printf("[OP %d PRODUTOR %d] Inserindo %d em buffer[%d]. Estado antes: %v\n",
-				opID, id, item, indexIn, buffer)
-
-			buffer[indexIn] = item
-			indexIn = (indexIn + 1) % N
-
-			// Debug: estado após inserção
-			fmt.Printf("[OP %d PRODUTOR %d] Inserção concluída. Estado após: %v\n",
-				opID, id, buffer)
-
-			mutex.Unlock()
-			full <- struct{}{} // sinaliza posição ocupada
-
-			// Verificação precisa do buffer cheio
-			mutex.Lock()
-			if (indexIn == indexOut) && (len(full) == N) {
-				fmt.Printf("[BUFFER] CHEIO! Posições ocupadas: %d/%d\n", len(full), N)
+			log("[PRODUTOR %d] Quer inserir %d. Posições livres: %d/%d\n", 
+				id, item, len(empty), cap(empty))
+			
+			select {
+			case <-empty: // aguarda posição livre
+				mutex.Lock()
+				// Debug: estado antes da inserção
+				operations++
+				opID := operations
+				log("[OP %d PRODUTOR %d] Inserindo %d em buffer[%d]. Estado antes: %v\n",
+					opID, id, item, indexIn, buffer)
+				
+				buffer[indexIn] = item
+				indexIn = (indexIn + 1) % N
+				produzidos++
+				
+				// Debug: estado após inserção
+				log("[OP %d PRODUTOR %d] Inserção concluída. Estado após: %v\n",
+					opID, id, buffer)
+				mutex.Unlock()
+				
+				full <- struct{}{} // sinaliza posição ocupada
+				
+				// Verificação do buffer cheio
+				if len(full) == cap(full) {
+					fmt.Printf("[BUFFER] CHEIO! Posições ocupadas: %d/%d\n", len(full), cap(full))
+				}
+				
+			case <-shutdown:
+				fmt.Printf("[PRODUTOR %d] Encerrando após produzir %d itens\n", id, produzidos)
+				return
 			}
-			mutex.Unlock()
-
+			
 			time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
 		}
 	}
@@ -105,46 +185,51 @@ func produtor(id int) {
 
 func consumidor(id int) {
 	defer wg.Done()
+	consumidos := 0
+
 	for {
 		select {
 		case <-shutdown:
-			fmt.Printf("[CONSUMIDOR %d] Encerrando\n", id)
+			fmt.Printf("[CONSUMIDOR %d] Encerrando após consumir %d itens\n", id, consumidos)
 			return
 		default:
-			// Verificação antes de remover
-			mutex.Lock()
+			// Verificação antes de tentar consumir
 			if len(full) == 1 {
 				fmt.Printf("[CONSUMIDOR %d] ATENÇÃO: Último item no buffer\n", id)
 			}
-			mutex.Unlock()
-
-			<-full // aguarda posição ocupada
-			mutex.Lock()
-
-			// Debug: estado antes da remoção
-			operations++
-			opID := operations
-			fmt.Printf("[OP %d CONSUMIDOR %d] Removendo de buffer[%d]. Estado antes: %v\n",
-				opID, id, indexOut, buffer)
-
-			item := buffer[indexOut]
-			buffer[indexOut] = 0 // limpa a posição para debug
-			indexOut = (indexOut + 1) % N
-
-			// Debug: estado após remoção
-			fmt.Printf("[OP %d CONSUMIDOR %d] Removeu %d. Estado após: %v\n",
-				opID, id, item, buffer)
-
-			mutex.Unlock()
-			empty <- struct{}{} // libera posição
-
-			// Verificação precisa do buffer vazio
-			mutex.Lock()
-			if indexIn == indexOut && len(full) == 0 {
-				fmt.Printf("[BUFFER] VAZIO! Posições ocupadas: %d/%d\n", len(full), N)
+			
+			select {
+			case <-full: // aguarda posição ocupada
+				mutex.Lock()
+				// Debug: estado antes da remoção
+				operations++
+				opID := operations
+				
+				log("[OP %d CONSUMIDOR %d] Removendo de buffer[%d]. Estado antes: %v\n",
+					opID, id, indexOut, buffer)
+				
+				item := buffer[indexOut]
+				buffer[indexOut] = 0 // limpa a posição para debug
+				indexOut = (indexOut + 1) % N
+				consumidos++
+				
+				// Debug: estado após remoção
+				log("[OP %d CONSUMIDOR %d] Removeu %d. Estado após: %v\n",
+					opID, id, item, buffer)
+				
+				mutex.Unlock()
+				empty <- struct{}{} // libera posição
+				
+				// Verificação do buffer vazio
+				if len(empty) == cap(empty) {
+					fmt.Printf("[BUFFER] VAZIO! Posições ocupadas: %d/%d\n", len(full), cap(full))
+				}
+				
+			case <-shutdown:
+				fmt.Printf("[CONSUMIDOR %d] Encerrando após consumir %d itens\n", id, consumidos)
+				return
 			}
-			mutex.Unlock()
-
+			
 			time.Sleep(time.Duration(rand.Intn(1500)) * time.Millisecond)
 		}
 	}
